@@ -2,36 +2,33 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# Durée max traitée par vidéo (secondes)
-MAX_DURATION_S = 40.0
-# Résolution d'analyse pour les features (plus petite que la sortie pour gagner du temps)
-ANALYSIS_WIDTH = 640
-ANALYSIS_HEIGHT = 360
-# Nombre maximum de frames utilisées pour calculer la transformation
-MAX_ANALYSIS_FRAMES = 60
+# Durée max de la partie utilisée des vidéos (en secondes, temps "réel")
+MAX_REAL_DURATION_S = 40.0
+
+# Résolution de sortie
+OUTPUT_WIDTH = 1280
+OUTPUT_HEIGHT = 720
+OUTPUT_FPS = 30
+
+# Facteur de vitesse (0.6 = 40% plus lent que l'original)
+SPEED_FACTOR = 0.6  # la vidéo est ralentie de 40%
 
 
-def _make_gate_mask(bgr_frame_resized):
+def _make_gate_mask(bgr_frame):
     """
     Masque pour isoler les portes de slalom :
     - drapeaux rouges / orangés
     - drapeaux bleus
-
-    On travaille en HSV, puis on combine les masques.
     """
-    hsv = cv2.cvtColor(bgr_frame_resized, cv2.COLOR_BGR2HSV)
+    hsv = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2HSV)
 
-    # --- PLAGES ROUGES / ORANGE (portes rouges) ---
-
-    # Rouge autour de 0°
+    # Plages rouges / oranges
     lower_red1 = np.array([0, 80, 70], dtype=np.uint8)
     upper_red1 = np.array([15, 255, 255], dtype=np.uint8)
 
-    # Rouge autour de 180°
     lower_red2 = np.array([160, 80, 70], dtype=np.uint8)
     upper_red2 = np.array([179, 255, 255], dtype=np.uint8)
 
-    # Orange / rouge clair (certains panneaux sont plus orangés)
     lower_orange = np.array([10, 80, 70], dtype=np.uint8)
     upper_orange = np.array([30, 255, 255], dtype=np.uint8)
 
@@ -42,155 +39,126 @@ def _make_gate_mask(bgr_frame_resized):
     mask_red = cv2.bitwise_or(mask_red1, mask_red2)
     mask_red = cv2.bitwise_or(mask_red, mask_orange)
 
-    # --- PLAGE BLEUE (portes bleues) ---
-    # Bleu typique : teinte ~100–140° -> [90, 130] dans l’espace OpenCV (0–179)
+    # Plage bleue
     lower_blue = np.array([90, 80, 70], dtype=np.uint8)
     upper_blue = np.array([130, 255, 255], dtype=np.uint8)
-
     mask_blue = cv2.inRange(hsv, lower_blue, upper_blue)
 
-    # --- COMBINAISON ROUGE + BLEU ---
+    # Combine rouge + bleu
     mask = cv2.bitwise_or(mask_red, mask_blue)
 
-    # Nettoyage : petite fermeture morphologique pour supprimer le bruit
+    # Nettoyage
     kernel = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
     return mask
 
 
-def _sample_frames(cap, max_duration_s=MAX_DURATION_S, max_frames=MAX_ANALYSIS_FRAMES):
+def _find_active_gate_bbox(mask):
     """
-    Choisit un sous-ensemble de frames (indice, temps) pour analyser la vidéo.
+    Trouve la "porte active" dans un masque binaire :
+    - on détecte les contours
+    - on filtre par taille
+    - on prend la porte dont le centre est le plus proche d'une bande
+      verticale en bas de l'image (60-80% de la hauteur).
+    Retourne (x, y, w, h) ou None si rien de valable.
     """
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if fps <= 0 or total_frames <= 0:
-        return []
+    h, w = mask.shape[:2]
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    total_duration = total_frames / fps
-    effective_duration = min(max_duration_s, total_duration)
-    if effective_duration <= 0:
-        return []
-
-    # On répartit max_frames sur la durée effective
-    step_t = effective_duration / max_frames
-    frames = []
-    for i in range(max_frames):
-        t = i * step_t
-        if t > effective_duration:
-            break
-        idx = int(min(t * fps, total_frames - 1))
-        frames.append((idx, t))
-    return frames
-
-
-def _read_frame(cap, index: int):
-    cap.set(cv2.CAP_PROP_POS_FRAMES, index)
-    ret, frame = cap.read()
-    return frame if ret else None
-
-
-def _compute_affine_transform_with_gates(video_path_ref: Path, video_path_to_align: Path):
-    """
-    Calcule une transformation affine globale (scale + rotation + translation)
-    qui aligne au mieux les portes (drapeaux) entre les deux vidéos.
-
-    On détecte les features avec ORB, mais en les limitant à un masque de couleur
-    correspondant aux drapeaux de slalom.
-    """
-    cap_ref = cv2.VideoCapture(str(video_path_ref))
-    cap_al = cv2.VideoCapture(str(video_path_to_align))
-
-    if not cap_ref.isOpened() or not cap_al.isOpened():
-        cap_ref.release()
-        cap_al.release()
-        return np.array([[1.0, 0.0, 0.0],
-                         [0.0, 1.0, 0.0]], dtype=np.float32)
-
-    samples_ref = _sample_frames(cap_ref)
-    samples_al = _sample_frames(cap_al)
-    n = min(len(samples_ref), len(samples_al))
-    if n == 0:
-        cap_ref.release()
-        cap_al.release()
-        return np.array([[1.0, 0.0, 0.0],
-                         [0.0, 1.0, 0.0]], dtype=np.float32)
-
-    orb = cv2.ORB_create(400)
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-
-    transforms = []
-
-    for i in range(n):
-        idx_ref, _ = samples_ref[i]
-        idx_al, _ = samples_al[i]
-
-        fr1 = _read_frame(cap_ref, idx_ref)
-        fr2 = _read_frame(cap_al, idx_al)
-        if fr1 is None or fr2 is None:
+    candidates = []
+    for cnt in contours:
+        x, y, cw, ch = cv2.boundingRect(cnt)
+        area = cw * ch
+        if area < (w * h) * 0.0005:  # trop petit -> bruit
+            continue
+        if area > (w * h) * 0.1:  # trop gros -> probablement pas une porte
             continue
 
-        fr1_small = cv2.resize(fr1, (ANALYSIS_WIDTH, ANALYSIS_HEIGHT))
-        fr2_small = cv2.resize(fr2, (ANALYSIS_WIDTH, ANALYSIS_HEIGHT))
+        cx = x + cw / 2.0
+        cy = y + ch / 2.0
+        candidates.append((x, y, cw, ch, cx, cy))
 
-        mask1 = _make_gate_mask(fr1_small)
-        mask2 = _make_gate_mask(fr2_small)
+    if not candidates:
+        return None
 
-        kp1, des1 = orb.detectAndCompute(fr1_small, mask1)
-        kp2, des2 = orb.detectAndCompute(fr2_small, mask2)
-        if des1 is None or des2 is None or len(kp1) < 4 or len(kp2) < 4:
-            continue
+    # On veut la porte dans une bande 60-80% de la hauteur (en bas/milieu)
+    band_top = h * 0.55
+    band_bottom = h * 0.85
 
-        # KNN matching + ratio test de Lowe
-        matches_knn = bf.knnMatch(des1, des2, k=2)
-        good = []
-        for m, n2 in matches_knn:
-            if m.distance < 0.75 * n2.distance:
-                good.append(m)
+    best = None
+    best_score = None
 
-        if len(good) < 6:
-            continue
+    for x, y, cw, ch, cx, cy in candidates:
+        # distance en y de la bande [band_top, band_bottom]
+        if cy < band_top:
+            dy = band_top - cy
+        elif cy > band_bottom:
+            dy = cy - band_bottom
+        else:
+            dy = 0.0
 
-        pts1 = np.float32([kp1[m.queryIdx].pt for m in good])
-        pts2 = np.float32([kp2[m.trainIdx].pt for m in good])
+        # plus on est proche de la bande, plus c'est "bon"
+        score = dy
 
-        # Transformation affine partielle (rotation + scale + translation)
-        M, inliers = cv2.estimateAffinePartial2D(
-            pts2, pts1, method=cv2.RANSAC, ransacReprojThreshold=4.0
-        )
-        if M is not None:
-            transforms.append(M.astype(np.float32))
+        if best is None or score < best_score:
+            best = (x, y, cw, ch)
+            best_score = score
 
-    cap_ref.release()
-    cap_al.release()
+    return best  # (x, y, w, h)
 
-    if not transforms:
-        # Identité si rien trouvé
-        return np.array([[1.0, 0.0, 0.0],
-                         [0.0, 1.0, 0.0]], dtype=np.float32)
 
-    # Moyenne des matrices 2x3
-    T = np.mean(np.stack(transforms, axis=0), axis=0)
-    return T.astype(np.float32)
+def _build_similarity_transform_from_bboxes(bbox_ref, bbox_align):
+    """
+    À partir de deux bboxes de portes (video1, video2),
+    calcule une transform 2x3 du type :
+      [ [s, 0, tx],
+        [0, s, ty] ]
+
+    qui aligne la porte de la video2 sur celle de la video1.
+    """
+    (x1, y1, w1, h1) = bbox_ref
+    (x2, y2, w2, h2) = bbox_align
+
+    # centres
+    cx1 = x1 + w1 / 2.0
+    cy1 = y1 + h1 / 2.0
+    cx2 = x2 + w2 / 2.0
+    cy2 = y2 + h2 / 2.0
+
+    # taille moyenne
+    size1 = (w1 + h1) / 2.0
+    size2 = (w2 + h2) / 2.0
+    if size2 < 1.0:
+        s = 1.0
+    else:
+        s = size1 / size2
+
+    # limiter les valeurs extrêmes
+    s = max(0.5, min(2.0, s))
+
+    tx = cx1 - s * cx2
+    ty = cy1 - s * cy2
+
+    M = np.array([[s, 0.0, tx],
+                  [0.0, s, ty]], dtype=np.float32)
+    return M
 
 
 def process_videos(
     video1_path: Path,
     video2_path: Path,
     output_path: Path,
-    max_duration_s: float = MAX_DURATION_S,
-    output_width: int = 1280,
-    output_height: int = 720,
-    output_fps: int = 30,
+    max_duration_s: float = MAX_REAL_DURATION_S,
+    output_width: int = OUTPUT_WIDTH,
+    output_height: int = OUTPUT_HEIGHT,
+    output_fps: int = OUTPUT_FPS,
 ):
     """
-    Crée une vidéo superposée à partir de deux vidéos :
+    Crée une vidéo superposée :
       - video1 = référence (fond)
-      - video2 = vidéo à aligner (overlay)
-
-    On calcule une transformation affine globale basée sur les portes,
-    puis on applique cette transform sur toutes les frames de la vidéo 2.
+      - video2 = overlay, réaligné frame par frame sur la porte active
+    La vidéo est ralentie de 40% (SPEED_FACTOR = 0.6).
     """
     video1_path = Path(video1_path)
     video2_path = Path(video2_path)
@@ -210,10 +178,13 @@ def process_videos(
     total1 = int(cap1.get(cv2.CAP_PROP_FRAME_COUNT))
     total2 = int(cap2.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Transformation globale (affine) à partir des portes
-    M = _compute_affine_transform_with_gates(video1_path, video2_path)
+    dur1 = total1 / fps1
+    dur2 = total2 / fps2
+    real_duration = min(dur1, dur2, max_duration_s)
 
-    max_frames_out = int(max_duration_s * output_fps)
+    # durée de la vidéo de sortie après ralenti
+    out_duration = real_duration / SPEED_FACTOR
+    max_frames_out = int(out_duration * output_fps)
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(
@@ -227,13 +198,18 @@ def process_videos(
         cap2.release()
         raise RuntimeError("Impossible d'ouvrir le writer vidéo.")
 
+    # transform de la frame précédente (pour continuité quand on ne trouve pas de porte)
+    prev_M = np.array([[1.0, 0.0, 0.0],
+                       [0.0, 1.0, 0.0]], dtype=np.float32)
+
     for i in range(max_frames_out):
-        t = i / output_fps
-        if t > max_duration_s:
+        # temps "réel" dans les vidéos originales (plus court que la sortie)
+        t_real = (i / output_fps) * SPEED_FACTOR
+        if t_real > real_duration:
             break
 
-        idx1 = int(min(t * fps1, max(total1 - 1, 0)))
-        idx2 = int(min(t * fps2, max(total2 - 1, 0)))
+        idx1 = int(min(t_real * fps1, max(total1 - 1, 0)))
+        idx2 = int(min(t_real * fps2, max(total2 - 1, 0)))
 
         cap1.set(cv2.CAP_PROP_POS_FRAMES, idx1)
         cap2.set(cv2.CAP_PROP_POS_FRAMES, idx2)
@@ -246,10 +222,25 @@ def process_videos(
         f1r = cv2.resize(f1, (output_width, output_height))
         f2r = cv2.resize(f2, (output_width, output_height))
 
-        # Application de la transform affine sur la vidéo 2
+        # détection des portes dans chaque frame
+        mask1 = _make_gate_mask(f1r)
+        mask2 = _make_gate_mask(f2r)
+
+        bbox1 = _find_active_gate_bbox(mask1)
+        bbox2 = _find_active_gate_bbox(mask2)
+
+        if bbox1 is not None and bbox2 is not None:
+            M_cur = _build_similarity_transform_from_bboxes(bbox1, bbox2)
+            # lissage avec la transform précédente (pour éviter les sauts)
+            alpha = 0.5
+            M = (alpha * M_cur + (1.0 - alpha) * prev_M).astype(np.float32)
+            prev_M = M
+        else:
+            # si on ne trouve pas de porte, on réutilise la transform précédente
+            M = prev_M
+
         warped2 = cv2.warpAffine(f2r, M, (output_width, output_height))
 
-        # Superposition simple
         blended = cv2.addWeighted(f1r, 0.5, warped2, 0.5, 0.0)
         writer.write(blended)
 
