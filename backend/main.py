@@ -9,11 +9,17 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from video_processing import process_videos
 
+# Valeurs par défaut côté API
+MAX_DURATION_DEFAULT = 40.0  # secondes max de vidéo à utiliser
+DEFAULT_OUTPUT_FPS = 30      # fps de sortie
+
 app = FastAPI()
+
 
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,12 +34,13 @@ OUTPUT_DIR = BASE / "outputs"
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+
 @app.post("/api/process")
 async def process_endpoint(
     video1: UploadFile = File(...),
     video2: UploadFile = File(...),
     max_duration_s: float = Query(MAX_DURATION_DEFAULT, ge=1, le=60),
-    output_fps: int = Query(30, ge=10, le=60),
+    output_fps: int = Query(DEFAULT_OUTPUT_FPS, ge=10, le=60),
 ):
     """
     Traite deux vidéos et renvoie un ID pour récupérer la vidéo superposée.
