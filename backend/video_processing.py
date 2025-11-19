@@ -13,31 +13,46 @@ MAX_ANALYSIS_FRAMES = 60
 
 def _make_gate_mask(bgr_frame_resized):
     """
-    Essaie d'isoler les portes de slalom (drapeaux rouges/orange) sur fond de neige.
-    On travaille en HSV et on filtre les teintes rouges / orangées.
+    Masque pour isoler les portes de slalom :
+    - drapeaux rouges / orangés
+    - drapeaux bleus
+
+    On travaille en HSV, puis on combine les masques.
     """
     hsv = cv2.cvtColor(bgr_frame_resized, cv2.COLOR_BGR2HSV)
 
-    # Plage rouge 1 (autour de 0°)
+    # --- PLAGES ROUGES / ORANGE (portes rouges) ---
+
+    # Rouge autour de 0°
     lower_red1 = np.array([0, 80, 70], dtype=np.uint8)
     upper_red1 = np.array([15, 255, 255], dtype=np.uint8)
 
-    # Plage rouge 2 (autour de 180°)
+    # Rouge autour de 180°
     lower_red2 = np.array([160, 80, 70], dtype=np.uint8)
     upper_red2 = np.array([179, 255, 255], dtype=np.uint8)
 
-    # Plage orange (portes un peu plus orangées)
+    # Orange / rouge clair (certains panneaux sont plus orangés)
     lower_orange = np.array([10, 80, 70], dtype=np.uint8)
     upper_orange = np.array([30, 255, 255], dtype=np.uint8)
 
-    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
-    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
-    mask3 = cv2.inRange(hsv, lower_orange, upper_orange)
+    mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    mask_red2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    mask_orange = cv2.inRange(hsv, lower_orange, upper_orange)
 
-    mask = cv2.bitwise_or(mask1, mask2)
-    mask = cv2.bitwise_or(mask, mask3)
+    mask_red = cv2.bitwise_or(mask_red1, mask_red2)
+    mask_red = cv2.bitwise_or(mask_red, mask_orange)
 
-    # Un peu de morphologie pour nettoyer (fermeture)
+    # --- PLAGE BLEUE (portes bleues) ---
+    # Bleu typique : teinte ~100–140° -> [90, 130] dans l’espace OpenCV (0–179)
+    lower_blue = np.array([90, 80, 70], dtype=np.uint8)
+    upper_blue = np.array([130, 255, 255], dtype=np.uint8)
+
+    mask_blue = cv2.inRange(hsv, lower_blue, upper_blue)
+
+    # --- COMBINAISON ROUGE + BLEU ---
+    mask = cv2.bitwise_or(mask_red, mask_blue)
+
+    # Nettoyage : petite fermeture morphologique pour supprimer le bruit
     kernel = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
