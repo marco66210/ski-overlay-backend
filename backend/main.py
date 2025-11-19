@@ -11,6 +11,10 @@ from video_processing import process_videos, MAX_DURATION_DEFAULT
 
 app = FastAPI()
 
+@app.get("/ping")
+def ping():
+    return {"status": "ok"}
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # à restreindre en prod
