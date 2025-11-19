@@ -1,67 +1,88 @@
-# backend/video_processing.py
 from pathlib import Path
-import subprocess
-import shlex
-
 import cv2
 import numpy as np
 
-# Limite vidéo
-MAX_DURATION_DEFAULT = 40.0  # secondes
-# Nombre max de frames utilisées pour ANALYSER (pas pour le rendu)
-MAX_ANALYSIS_FRAMES = 80
-# Nombre de segments temporels pour les homographies
-NUM_SEGMENTS = 4
+# Durée max traitée par vidéo (secondes)
+MAX_DURATION_S = 40.0
+# Résolution d'analyse pour les features (plus petite que la sortie pour gagner du temps)
+ANALYSIS_WIDTH = 640
+ANALYSIS_HEIGHT = 360
+# Nombre maximum de frames utilisées pour calculer la transformation
+MAX_ANALYSIS_FRAMES = 60
 
 
-def _sample_frames(cap, max_duration_s=MAX_DURATION_DEFAULT, max_frames=MAX_ANALYSIS_FRAMES):
+def _make_gate_mask(bgr_frame_resized):
     """
-    Échantillonne au plus `max_frames` frames sur la durée max `max_duration_s`.
-    Retourne une liste de tuples (frame_index, time_seconds).
+    Essaie d'isoler les portes de slalom (drapeaux rouges/orange) sur fond de neige.
+    On travaille en HSV et on filtre les teintes rouges / orangées.
+    """
+    hsv = cv2.cvtColor(bgr_frame_resized, cv2.COLOR_BGR2HSV)
+
+    # Plage rouge 1 (autour de 0°)
+    lower_red1 = np.array([0, 80, 70], dtype=np.uint8)
+    upper_red1 = np.array([15, 255, 255], dtype=np.uint8)
+
+    # Plage rouge 2 (autour de 180°)
+    lower_red2 = np.array([160, 80, 70], dtype=np.uint8)
+    upper_red2 = np.array([179, 255, 255], dtype=np.uint8)
+
+    # Plage orange (portes un peu plus orangées)
+    lower_orange = np.array([10, 80, 70], dtype=np.uint8)
+    upper_orange = np.array([30, 255, 255], dtype=np.uint8)
+
+    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    mask3 = cv2.inRange(hsv, lower_orange, upper_orange)
+
+    mask = cv2.bitwise_or(mask1, mask2)
+    mask = cv2.bitwise_or(mask, mask3)
+
+    # Un peu de morphologie pour nettoyer (fermeture)
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    return mask
+
+
+def _sample_frames(cap, max_duration_s=MAX_DURATION_S, max_frames=MAX_ANALYSIS_FRAMES):
+    """
+    Choisit un sous-ensemble de frames (indice, temps) pour analyser la vidéo.
     """
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
     if fps <= 0 or total_frames <= 0:
         return []
 
     total_duration = total_frames / fps
     effective_duration = min(max_duration_s, total_duration)
-
-    if effective_duration <= 0 or max_frames <= 0:
+    if effective_duration <= 0:
         return []
 
+    # On répartit max_frames sur la durée effective
     step_t = effective_duration / max_frames
     frames = []
-
     for i in range(max_frames):
         t = i * step_t
         if t > effective_duration:
             break
         idx = int(min(t * fps, total_frames - 1))
         frames.append((idx, t))
-
     return frames
 
 
 def _read_frame(cap, index: int):
-    """
-    Lit une frame à un index donné.
-    """
     cap.set(cv2.CAP_PROP_POS_FRAMES, index)
     ret, frame = cap.read()
     return frame if ret else None
 
 
-def _compute_segmented_homographies(
-    video_path_ref: Path,
-    video_path_to_align: Path,
-    num_segments: int = NUM_SEGMENTS,
-    max_duration_s: float = MAX_DURATION_DEFAULT,
-):
+def _compute_affine_transform_with_gates(video_path_ref: Path, video_path_to_align: Path):
     """
-    Calcule des homographies moyennes par segments de temps.
-    Retourne (liste_H_par_segment, H_globale).
+    Calcule une transformation affine globale (scale + rotation + translation)
+    qui aligne au mieux les portes (drapeaux) entre les deux vidéos.
+
+    On détecte les features avec ORB, mais en les limitant à un masque de couleur
+    correspondant aux drapeaux de slalom.
     """
     cap_ref = cv2.VideoCapture(str(video_path_ref))
     cap_al = cv2.VideoCapture(str(video_path_to_align))
@@ -69,142 +90,100 @@ def _compute_segmented_homographies(
     if not cap_ref.isOpened() or not cap_al.isOpened():
         cap_ref.release()
         cap_al.release()
-        identity = np.eye(3)
-        return [identity for _ in range(num_segments)], identity
+        return np.array([[1.0, 0.0, 0.0],
+                         [0.0, 1.0, 0.0]], dtype=np.float32)
 
-    samples_ref = _sample_frames(cap_ref, max_duration_s=max_duration_s)
-    samples_al = _sample_frames(cap_al, max_duration_s=max_duration_s)
+    samples_ref = _sample_frames(cap_ref)
+    samples_al = _sample_frames(cap_al)
+    n = min(len(samples_ref), len(samples_al))
+    if n == 0:
+        cap_ref.release()
+        cap_al.release()
+        return np.array([[1.0, 0.0, 0.0],
+                         [0.0, 1.0, 0.0]], dtype=np.float32)
 
-    orb = cv2.ORB_create(300)
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    orb = cv2.ORB_create(400)
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
 
-    seg_homos = [[] for _ in range(num_segments)]
-    all_homos = []
+    transforms = []
 
-    min_len = min(len(samples_ref), len(samples_al))
-
-    for i in range(min_len):
-        idx_ref, t_ref = samples_ref[i]
-        idx_al, t_al = samples_al[i]
+    for i in range(n):
+        idx_ref, _ = samples_ref[i]
+        idx_al, _ = samples_al[i]
 
         fr1 = _read_frame(cap_ref, idx_ref)
         fr2 = _read_frame(cap_al, idx_al)
         if fr1 is None or fr2 is None:
             continue
 
-        # downscale pour la détection de features (rapide)
-        target_size = (640, 360)
-        fr1s = cv2.resize(fr1, target_size)
-        fr2s = cv2.resize(fr2, target_size)
+        fr1_small = cv2.resize(fr1, (ANALYSIS_WIDTH, ANALYSIS_HEIGHT))
+        fr2_small = cv2.resize(fr2, (ANALYSIS_WIDTH, ANALYSIS_HEIGHT))
 
-        kp1, d1 = orb.detectAndCompute(fr1s, None)
-        kp2, d2 = orb.detectAndCompute(fr2s, None)
-        if d1 is None or d2 is None:
+        mask1 = _make_gate_mask(fr1_small)
+        mask2 = _make_gate_mask(fr2_small)
+
+        kp1, des1 = orb.detectAndCompute(fr1_small, mask1)
+        kp2, des2 = orb.detectAndCompute(fr2_small, mask2)
+        if des1 is None or des2 is None or len(kp1) < 4 or len(kp2) < 4:
             continue
 
-        matches = bf.match(d1, d2)
-        if len(matches) < 12:
+        # KNN matching + ratio test de Lowe
+        matches_knn = bf.knnMatch(des1, des2, k=2)
+        good = []
+        for m, n2 in matches_knn:
+            if m.distance < 0.75 * n2.distance:
+                good.append(m)
+
+        if len(good) < 6:
             continue
 
-        # garder seulement les meilleurs matches
-        matches = sorted(matches, key=lambda m: m.distance)[:60]
+        pts1 = np.float32([kp1[m.queryIdx].pt for m in good])
+        pts2 = np.float32([kp2[m.trainIdx].pt for m in good])
 
-        pts1 = np.float32([kp1[m.queryIdx].pt for m in matches])
-        pts2 = np.float32([kp2[m.trainIdx].pt for m in matches])
-
-        H, mask = cv2.findHomography(pts2, pts1, cv2.RANSAC, 5.0)
-        if H is None:
-            continue
-
-        all_homos.append(H)
-
-        # Attribution à un segment temporel
-        seg_idx = int((t_ref / max_duration_s) * num_segments)
-        if seg_idx >= num_segments:
-            seg_idx = num_segments - 1
-        seg_homos[seg_idx].append(H)
+        # Transformation affine partielle (rotation + scale + translation)
+        M, inliers = cv2.estimateAffinePartial2D(
+            pts2, pts1, method=cv2.RANSAC, ransacReprojThreshold=4.0
+        )
+        if M is not None:
+            transforms.append(M.astype(np.float32))
 
     cap_ref.release()
     cap_al.release()
 
-    if not all_homos:
-        identity = np.eye(3)
-        return [identity for _ in range(num_segments)], identity
+    if not transforms:
+        # Identité si rien trouvé
+        return np.array([[1.0, 0.0, 0.0],
+                         [0.0, 1.0, 0.0]], dtype=np.float32)
 
-    # Homographie globale moyenne
-    H_global = np.mean(np.stack(all_homos), axis=0)
-    if H_global[2, 2] != 0:
-        H_global /= H_global[2, 2]
-
-    # Homographies par segment
-    seg_H_final = []
-    for h_list in seg_homos:
-        if not h_list:
-            seg_H_final.append(H_global)
-        else:
-            Hm = np.mean(np.stack(h_list), axis=0)
-            if Hm[2, 2] != 0:
-                Hm /= Hm[2, 2]
-            seg_H_final.append(Hm)
-
-    return seg_H_final, H_global
-
-
-def _encode_with_ffmpeg(tmp_path: Path, final_path: Path, fps: int):
-    """
-    Encode le fichier temporaire (MJPEG AVI) en MP4 H.264 via ffmpeg.
-    Si ffmpeg n'est pas dispo, on garde le fichier tmp tel quel.
-    """
-    cmd = (
-        f'ffmpeg -y -loglevel error '
-        f'-i "{tmp_path}" '
-        f'-c:v libx264 -preset veryfast -crf 23 '
-        f'-r {fps} '
-        f'"{final_path}"'
-    )
-
-    try:
-        subprocess.run(shlex.split(cmd), check=True)
-        # Si tout s'est bien passé, on supprime le tmp
-        try:
-            tmp_path.unlink()
-        except FileNotFoundError:
-            pass
-    except FileNotFoundError:
-        # ffmpeg pas installé -> fallback : on renomme juste
-        tmp_path.replace(final_path)
-    except subprocess.CalledProcessError:
-        # erreur ffmpeg -> fallback
-        if not final_path.exists():
-            tmp_path.replace(final_path)
+    # Moyenne des matrices 2x3
+    T = np.mean(np.stack(transforms, axis=0), axis=0)
+    return T.astype(np.float32)
 
 
 def process_videos(
     video1_path: Path,
     video2_path: Path,
     output_path: Path,
-    max_duration_s: float = MAX_DURATION_DEFAULT,
+    max_duration_s: float = MAX_DURATION_S,
     output_width: int = 1280,
     output_height: int = 720,
     output_fps: int = 30,
 ):
     """
     Crée une vidéo superposée à partir de deux vidéos :
-      - video1 = référence
-      - video2 = vidéo à aligner
+      - video1 = référence (fond)
+      - video2 = vidéo à aligner (overlay)
 
-    Sortie : MP4 720p / 30 fps (par défaut).
+    On calcule une transformation affine globale basée sur les portes,
+    puis on applique cette transform sur toutes les frames de la vidéo 2.
     """
     video1_path = Path(video1_path)
     video2_path = Path(video2_path)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    max_duration_s = float(max_duration_s)
-
     cap1 = cv2.VideoCapture(str(video1_path))
     cap2 = cv2.VideoCapture(str(video2_path))
-
     if not cap1.isOpened() or not cap2.isOpened():
         cap1.release()
         cap2.release()
@@ -216,38 +195,27 @@ def process_videos(
     total1 = int(cap1.get(cv2.CAP_PROP_FRAME_COUNT))
     total2 = int(cap2.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Homographies par segments (plus stable qu'une seule matrice globale)
-    seg_H_list, H_global = _compute_segmented_homographies(
-        video1_path, video2_path, num_segments=NUM_SEGMENTS, max_duration_s=max_duration_s
-    )
+    # Transformation globale (affine) à partir des portes
+    M = _compute_affine_transform_with_gates(video1_path, video2_path)
 
-    max_out_frames = int(max_duration_s * output_fps)
+    max_frames_out = int(max_duration_s * output_fps)
 
-    # Fichier vidéo temporaire (MJPEG) avant passage dans ffmpeg
-    tmp_path = output_path.with_suffix(".avi")
-    fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(
-        str(tmp_path),
+        str(output_path),
         fourcc,
         output_fps,
         (output_width, output_height),
     )
-
     if not writer.isOpened():
         cap1.release()
         cap2.release()
         raise RuntimeError("Impossible d'ouvrir le writer vidéo.")
 
-    for i in range(max_out_frames):
+    for i in range(max_frames_out):
         t = i / output_fps
         if t > max_duration_s:
             break
-
-        # Segment temporel courant
-        seg_idx = int((t / max_duration_s) * NUM_SEGMENTS)
-        if seg_idx >= NUM_SEGMENTS:
-            seg_idx = NUM_SEGMENTS - 1
-        H = seg_H_list[seg_idx]
 
         idx1 = int(min(t * fps1, max(total1 - 1, 0)))
         idx2 = int(min(t * fps2, max(total2 - 1, 0)))
@@ -263,16 +231,15 @@ def process_videos(
         f1r = cv2.resize(f1, (output_width, output_height))
         f2r = cv2.resize(f2, (output_width, output_height))
 
-        warped = cv2.warpPerspective(f2r, H, (output_width, output_height))
-        blended = cv2.addWeighted(f1r, 0.5, warped, 0.5, 0.0)
+        # Application de la transform affine sur la vidéo 2
+        warped2 = cv2.warpAffine(f2r, M, (output_width, output_height))
 
+        # Superposition simple
+        blended = cv2.addWeighted(f1r, 0.5, warped2, 0.5, 0.0)
         writer.write(blended)
 
     cap1.release()
     cap2.release()
     writer.release()
-
-    # Encodage final via ffmpeg (avec fallback)
-    _encode_with_ffmpeg(tmp_path, output_path, output_fps)
 
     return output_path
