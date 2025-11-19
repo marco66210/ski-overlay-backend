@@ -7,7 +7,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from video_processing import process_videos, MAX_DURATION_DEFAULT
+from video_processing import process_videos
 
 app = FastAPI()
 
@@ -27,7 +27,6 @@ UPLOAD_DIR = BASE / "uploads"
 OUTPUT_DIR = BASE / "outputs"
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
-
 
 @app.post("/api/process")
 async def process_endpoint(
