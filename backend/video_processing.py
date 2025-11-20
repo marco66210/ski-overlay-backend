@@ -5,144 +5,71 @@ import numpy as np
 # Durée max de la partie utilisée des vidéos (en secondes, temps "réel")
 MAX_REAL_DURATION_S = 40.0
 
-# Résolution de sortie
+# Résolution de sortie (après crop + resize)
 OUTPUT_WIDTH = 1280
 OUTPUT_HEIGHT = 720
 OUTPUT_FPS = 30
 
 # Facteur de vitesse (0.6 = 40% plus lent que l'original)
-SPEED_FACTOR = 0.6  # la vidéo est ralentie de 40%
+SPEED_FACTOR = 0.6  # la vidéo est ralentie de 40 %
 
 
-def _make_gate_mask(bgr_frame):
+# Résolution d'analyse pour le tracking (on travaille en plus petit pour aller plus vite)
+ANALYSIS_WIDTH = 640
+ANALYSIS_HEIGHT = 360
+
+# Taille relative du crop (par rapport à la résolution source)
+# Exemple : 0.6 -> on prend un rectangle couvrant ~60% de la largeur / hauteur
+CROP_REL_W = 0.6
+CROP_REL_H = 0.6
+
+
+def _detect_moving_box(bg_subtractor, frame_bgr):
     """
-    Masque pour isoler les portes de slalom :
-    - drapeaux rouges / orangés
-    - drapeaux bleus
+    Détecte la personne (skieur) comme le plus gros blob en mouvement
+    sur une frame (en BGR).
+    On travaille sur une version réduite pour aller plus vite.
+    Retourne (cx, cy) dans les coordonnées de la FRAME ORIGINALE,
+    ou None si rien de fiable.
     """
-    hsv = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2HSV)
+    h, w = frame_bgr.shape[:2]
 
-    # Plages rouges / oranges
-    lower_red1 = np.array([0, 80, 70], dtype=np.uint8)
-    upper_red1 = np.array([15, 255, 255], dtype=np.uint8)
+    # Resize pour analyse
+    small = cv2.resize(frame_bgr, (ANALYSIS_WIDTH, ANALYSIS_HEIGHT))
 
-    lower_red2 = np.array([160, 80, 70], dtype=np.uint8)
-    upper_red2 = np.array([179, 255, 255], dtype=np.uint8)
+    fgmask = bg_subtractor.apply(small)
 
-    lower_orange = np.array([10, 80, 70], dtype=np.uint8)
-    upper_orange = np.array([30, 255, 255], dtype=np.uint8)
-
-    mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)
-    mask_red2 = cv2.inRange(hsv, lower_red2, upper_red2)
-    mask_orange = cv2.inRange(hsv, lower_orange, upper_orange)
-
-    mask_red = cv2.bitwise_or(mask_red1, mask_red2)
-    mask_red = cv2.bitwise_or(mask_red, mask_orange)
-
-    # Plage bleue
-    lower_blue = np.array([90, 80, 70], dtype=np.uint8)
-    upper_blue = np.array([130, 255, 255], dtype=np.uint8)
-    mask_blue = cv2.inRange(hsv, lower_blue, upper_blue)
-
-    # Combine rouge + bleu
-    mask = cv2.bitwise_or(mask_red, mask_blue)
-
-    # Nettoyage
+    # On nettoie un peu le masque
+    _, fgmask = cv2.threshold(fgmask, 200, 255, cv2.THRESH_BINARY)
     kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_OPEN, kernel, iterations=1)
+    fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_DILATE, kernel, iterations=2)
 
-    return mask
-
-
-def _find_active_gate_bbox(mask):
-    """
-    Trouve la "porte active" dans un masque binaire :
-    - on détecte les contours
-    - on filtre par taille
-    - on prend la porte dont le centre est le plus proche d'une bande
-      verticale en bas de l'image (60-80% de la hauteur).
-    Retourne (x, y, w, h) ou None si rien de valable.
-    """
-    h, w = mask.shape[:2]
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    candidates = []
-    for cnt in contours:
-        x, y, cw, ch = cv2.boundingRect(cnt)
-        area = cw * ch
-        if area < (w * h) * 0.0005:  # trop petit -> bruit
-            continue
-        if area > (w * h) * 0.1:  # trop gros -> probablement pas une porte
-            continue
-
-        cx = x + cw / 2.0
-        cy = y + ch / 2.0
-        candidates.append((x, y, cw, ch, cx, cy))
-
-    if not candidates:
+    contours, _ = cv2.findContours(fgmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
         return None
 
-    # On veut la porte dans une bande 60-80% de la hauteur (en bas/milieu)
-    band_top = h * 0.55
-    band_bottom = h * 0.85
+    # On prend le plus grand contour comme "skieur"
+    best_cnt = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(best_cnt)
 
-    best = None
-    best_score = None
+    # Si l'aire est ridicule, on considère qu'on n'a rien trouvé
+    min_area = (ANALYSIS_WIDTH * ANALYSIS_HEIGHT) * 0.001
+    if area < min_area:
+        return None
 
-    for x, y, cw, ch, cx, cy in candidates:
-        # distance en y de la bande [band_top, band_bottom]
-        if cy < band_top:
-            dy = band_top - cy
-        elif cy > band_bottom:
-            dy = cy - band_bottom
-        else:
-            dy = 0.0
+    x, y, cw, ch = cv2.boundingRect(best_cnt)
+    cx_small = x + cw / 2.0
+    cy_small = y + ch / 2.0
 
-        # plus on est proche de la bande, plus c'est "bon"
-        score = dy
+    # Remap dans les coordonnées originales
+    sx = w / float(ANALYSIS_WIDTH)
+    sy = h / float(ANALYSIS_HEIGHT)
 
-        if best is None or score < best_score:
-            best = (x, y, cw, ch)
-            best_score = score
+    cx = cx_small * sx
+    cy = cy_small * sy
 
-    return best  # (x, y, w, h)
-
-
-def _build_similarity_transform_from_bboxes(bbox_ref, bbox_align):
-    """
-    À partir de deux bboxes de portes (video1, video2),
-    calcule une transform 2x3 du type :
-      [ [s, 0, tx],
-        [0, s, ty] ]
-
-    qui aligne la porte de la video2 sur celle de la video1.
-    """
-    (x1, y1, w1, h1) = bbox_ref
-    (x2, y2, w2, h2) = bbox_align
-
-    # centres
-    cx1 = x1 + w1 / 2.0
-    cy1 = y1 + h1 / 2.0
-    cx2 = x2 + w2 / 2.0
-    cy2 = y2 + h2 / 2.0
-
-    # taille moyenne
-    size1 = (w1 + h1) / 2.0
-    size2 = (w2 + h2) / 2.0
-    if size2 < 1.0:
-        s = 1.0
-    else:
-        s = size1 / size2
-
-    # limiter les valeurs extrêmes
-    s = max(0.5, min(2.0, s))
-
-    tx = cx1 - s * cx2
-    ty = cy1 - s * cy2
-
-    M = np.array([[s, 0.0, tx],
-                  [0.0, s, ty]], dtype=np.float32)
-    return M
+    return cx, cy
 
 
 def process_videos(
@@ -155,10 +82,17 @@ def process_videos(
     output_fps: int = OUTPUT_FPS,
 ):
     """
-    Crée une vidéo superposée :
-      - video1 = référence (fond)
-      - video2 = overlay, réaligné frame par frame sur la porte active
-    La vidéo est ralentie de 40% (SPEED_FACTOR = 0.6).
+    Cas caméra FIXE sur pied (4K ou 1080p) :
+
+    - Les deux vidéos ont le même cadrage (ou très proche),
+    - On détecte le skieur sur chaque vidéo (blob en mouvement),
+    - On calcule un centre moyen des deux skieurs,
+    - On définit un CROP (fenêtre) autour de ce centre,
+    - On extrait le même CROP dans les deux vidéos,
+    - On les overlay (alpha 0.5),
+    - On ralentit la vidéo de 40 % (SPEED_FACTOR = 0.6).
+
+    Résultat : une vidéo recadrée qui suit les 2 skieurs au fil du run.
     """
     video1_path = Path(video1_path)
     video2_path = Path(video2_path)
@@ -182,10 +116,28 @@ def process_videos(
     dur2 = total2 / fps2
     real_duration = min(dur1, dur2, max_duration_s)
 
-    # durée de la vidéo de sortie après ralenti
+    # Nombre de frames de sortie après ralenti
     out_duration = real_duration / SPEED_FACTOR
     max_frames_out = int(out_duration * output_fps)
 
+    # On supposera que les résolutions des deux vidéos sont identiques ou très proches.
+    # On prendra la résolution de la première vidéo comme base.
+    cap1.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    ret1, first_frame1 = cap1.read()
+    if not ret1:
+        cap1.release()
+        cap2.release()
+        raise RuntimeError("Impossible de lire la première frame de la vidéo 1.")
+
+    h1, w1 = first_frame1.shape[:2]
+
+    # Dimension du crop dans l'image source
+    crop_w = int(w1 * CROP_REL_W)
+    crop_h = int(h1 * CROP_REL_H)
+    crop_w = max(32, min(w1, crop_w))
+    crop_h = max(32, min(h1, crop_h))
+
+    # Writer pour la vidéo de sortie
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(
         str(output_path),
@@ -198,12 +150,16 @@ def process_videos(
         cap2.release()
         raise RuntimeError("Impossible d'ouvrir le writer vidéo.")
 
-    # transform de la frame précédente (pour continuité quand on ne trouve pas de porte)
-    prev_M = np.array([[1.0, 0.0, 0.0],
-                       [0.0, 1.0, 0.0]], dtype=np.float32)
+    # Background subtractors pour les 2 vidéos (tracking des skieurs)
+    bg1 = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=False)
+    bg2 = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=False)
+
+    # Valeurs par défaut des centres (milieu de l'image)
+    cx1_prev, cy1_prev = w1 / 2.0, h1 / 2.0
+    cx2_prev, cy2_prev = w1 / 2.0, h1 / 2.0
 
     for i in range(max_frames_out):
-        # temps "réel" dans les vidéos originales (plus court que la sortie)
+        # Temps réel dans les vidéos originales
         t_real = (i / output_fps) * SPEED_FACTOR
         if t_real > real_duration:
             break
@@ -219,29 +175,53 @@ def process_videos(
         if not ret1 or not ret2:
             break
 
-        f1r = cv2.resize(f1, (output_width, output_height))
-        f2r = cv2.resize(f2, (output_width, output_height))
+        # Assurer même résolution (au cas où les 2 vidéos diffèrent légèrement)
+        f1r = f1
+        f2r = cv2.resize(f2, (f1r.shape[1], f1r.shape[0]))
 
-        # détection des portes dans chaque frame
-        mask1 = _make_gate_mask(f1r)
-        mask2 = _make_gate_mask(f2r)
+        h, w = f1r.shape[:2]
 
-        bbox1 = _find_active_gate_bbox(mask1)
-        bbox2 = _find_active_gate_bbox(mask2)
+        # Détection skieurs
+        c1 = _detect_moving_box(bg1, f1r)
+        c2 = _detect_moving_box(bg2, f2r)
 
-        if bbox1 is not None and bbox2 is not None:
-            M_cur = _build_similarity_transform_from_bboxes(bbox1, bbox2)
-            # lissage avec la transform précédente (pour éviter les sauts)
-            alpha = 0.5
-            M = (alpha * M_cur + (1.0 - alpha) * prev_M).astype(np.float32)
-            prev_M = M
-        else:
-            # si on ne trouve pas de porte, on réutilise la transform précédente
-            M = prev_M
+        if c1 is not None:
+            cx1_prev, cy1_prev = c1
+        if c2 is not None:
+            cx2_prev, cy2_prev = c2
 
-        warped2 = cv2.warpAffine(f2r, M, (output_width, output_height))
+        # Centre moyen des 2 skieurs
+        cx_avg = (cx1_prev + cx2_prev) / 2.0
+        cy_avg = (cy1_prev + cy2_prev) / 2.0
 
-        blended = cv2.addWeighted(f1r, 0.5, warped2, 0.5, 0.0)
+        # On centre le crop sur cx_avg, cy_avg, en restant dans l'image
+        half_w = crop_w / 2.0
+        half_h = crop_h / 2.0
+
+        x0 = int(cx_avg - half_w)
+        y0 = int(cy_avg - half_h)
+
+        # Clamp pour rester dans l'image
+        x0 = max(0, min(w - crop_w, x0))
+        y0 = max(0, min(h - crop_h, y0))
+
+        x1 = x0 + crop_w
+        y1 = y0 + crop_h
+
+        # Crop des 2 vidéos au même endroit
+        crop1 = f1r[y0:y1, x0:x1]
+        crop2 = f2r[y0:y1, x0:x1]
+
+        # Sécurité : si le crop sort de l'image pour une raison quelconque
+        if crop1.shape[0] <= 0 or crop1.shape[1] <= 0 or crop2.shape[0] <= 0 or crop2.shape[1] <= 0:
+            continue
+
+        # Resize vers la résolution de sortie
+        crop1_res = cv2.resize(crop1, (output_width, output_height))
+        crop2_res = cv2.resize(crop2, (output_width, output_height))
+
+        # Superposition
+        blended = cv2.addWeighted(crop1_res, 0.5, crop2_res, 0.5, 0.0)
         writer.write(blended)
 
     cap1.release()
