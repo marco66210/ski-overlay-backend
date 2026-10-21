@@ -1,0 +1,18 @@
+/* skighost — design tokens */
+:root {
+  /* Couleurs de marque */
+  --sg-ink: #16123F;        /* bleu nuit violacé — fond principal, texte */
+  --sg-magenta: #E62BF5;    /* fuchsia magenta acidulé — accent (masque, ski, CTA) */
+  --sg-white: #FFFFFF;      /* fantôme sur fond sombre */
+
+  /* Dérivés utiles pour l'UI */
+  --sg-magenta-hover: #D11BE0;
+  --sg-magenta-soft: #F7C9FC;
+  --sg-ink-soft: #2A2560;
+  --sg-surface: #F6F5FB;
+
+  /* Typographie — Inter Display (OFL) */
+  --sg-font: "Inter Display", "Inter", system-ui, sans-serif;
+  --sg-weight-strong: 900;  /* "ski" : Black Italic */
+  --sg-weight-light: 300;   /* "ghost" : Light Italic */
+}
