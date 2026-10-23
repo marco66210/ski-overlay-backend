@@ -25,6 +25,7 @@ Tous les SVG ont un fond transparent (vraies découpes) ; chaque SVG a son PNG �
 | `logo/` | Logo horizontal (fantôme + skighost) : `on-dark`, `on-light`, `on-magenta` — PNG 2400 px |
 | `symbol/` | Fantôme seul, mêmes trois versions — PNG 1024 px |
 | `social/` | Avatars Instagram ronds (`ink`, `magenta`) — PNG 1080 px |
+| `facebook/` | Photo de profil (1080 × 1080, carrée) et photo de couverture (1640 × 624) |
 | `web/` | `favicon.ico`, `favicon.svg`, icônes PWA, `apple-touch-icon.png`, `site.webmanifest`, `head-snippet.html` |
 
 Choisir la version selon le fond : `on-dark` sur bleu nuit ou photo sombre, `on-light` sur blanc

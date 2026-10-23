@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256"><rect width="256" height="256" fill="#16123F"/>
+<g transform="translate(128 124) scale(.74) translate(-132 -128)"><defs><clipPath id="s"><path d="M84,88 A44,44 0 0 1 172,88 C172,128 182,160 204,188 Q190,190 180,182 Q172,196 158,204 Q146,190 134,186 Q124,200 106,206 Q96,190 84,186 Q72,196 54,194 C74,164 84,130 84,88 Z"/></clipPath></defs>
+<g id="symbol"><g transform="translate(6 -4) rotate(12 128 140)"><path clip-path="url(#s)" fill="#FFFFFF" fill-rule="evenodd" d="M84,88 A44,44 0 0 1 172,88 C172,128 182,160 204,188 Q190,190 180,182 Q172,196 158,204 Q146,190 134,186 Q124,200 106,206 Q96,190 84,186 Q72,196 54,194 C74,164 84,130 84,88 Z M110,80 H146 A24,24 0 0 1 146,128 H110 A24,24 0 0 1 110,80 Z M50,100 H87 V108 H50 Z M169,100 H210 V108 H169 Z"/>
+<path fill="#E62BF5" d="M110,80 H146 A24,24 0 0 1 146,128 H110 A24,24 0 0 1 110,80 Z"/><path fill="#16123F" d="M106,104 a8,12 0 1 0 16,0 a8,12 0 1 0 -16,0 Z M134,104 a8,12 0 1 0 16,0 a8,12 0 1 0 -16,0 Z"/></g>
+<path fill="none" stroke="#E62BF5" stroke-width="17" stroke-linecap="round" d="M40,224 H194 Q218,224 224,204"/></g></g></svg>
